@@ -169,10 +169,12 @@ def create_app(
     from .api.routes.media import router as media_router
     from .api.routes.feedback import router as feedback_router
     from .api.routes.billing import router as billing_router
+    from .api.routes.patterns import router as patterns_router
 
     app.include_router(media_router)
     app.include_router(feedback_router)
     app.include_router(billing_router)
+    app.include_router(patterns_router)
 
     @app.get("/")
     def read_root():

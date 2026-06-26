@@ -27,6 +27,7 @@ async def process_video_task(
     output_format: str = "vertical",
     add_subtitles: bool = True,
     cleanup_settings: Dict[str, Any] | None = None,
+    pattern_detection_config: str | None = None,
 ) -> Dict[str, Any]:
     """
     Background worker task to process a video.
@@ -76,6 +77,16 @@ async def process_video_task(
             ):
                 await progress.clip_ready(clip_index, total_clips, clip_data)
 
+            # Parse pattern detection config if provided
+            parsed_pattern_config = None
+            if pattern_detection_config:
+                try:
+                    parsed_pattern_config = json.loads(pattern_detection_config)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Invalid pattern_detection_config for task %s", task_id
+                    )
+
             # Process the video
             result = await task_service.process_task(
                 task_id=task_id,
@@ -92,6 +103,7 @@ async def process_video_task(
                 should_cancel=should_cancel,
                 clip_ready_callback=clip_ready_callback,
                 cleanup_settings=cleanup_settings,
+                pattern_detection_config=parsed_pattern_config,
             )
 
             logger.info(f"Task {task_id} completed successfully")

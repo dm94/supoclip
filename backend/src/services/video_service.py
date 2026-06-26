@@ -33,6 +33,11 @@ from ..clip_source_map import (
 )
 from ..ai import get_most_relevant_parts_by_transcript
 from ..config import get_config
+from ..pattern_detection import (
+    detect_patterns_in_video,
+    build_segments_from_matches,
+    merge_segments,
+)
 
 logger = logging.getLogger(__name__)
 UPLOAD_URL_PREFIX = "upload://"
@@ -314,6 +319,7 @@ class VideoService:
         processing_mode: str = "fast",
         output_format: str = "vertical",
         add_subtitles: bool = True,
+        pattern_detection_config: Optional[Dict[str, Any]] = None,
         cached_transcript: Optional[str] = None,
         cached_analysis_json: Optional[str] = None,
         progress_callback: Optional[Callable[[int, str, str], Awaitable[None]]] = None,
@@ -363,71 +369,176 @@ class VideoService:
                     f"Maximum allowed duration is {mins} minutes."
                 )
 
-            # Step 2: Generate transcript
-            if should_cancel and await should_cancel():
-                raise Exception("Task cancelled")
+            # Determine pattern detection mode
+            pattern_enabled = bool(
+                pattern_detection_config and pattern_detection_config.get("enabled")
+            )
+            pattern_mode = (pattern_detection_config or {}).get(
+                "mode", "patterns_only"
+            )
+            pattern_mode = pattern_mode if pattern_mode in {"patterns_only", "combined", "ai_only"} else "patterns_only"
+            pattern_patterns = (pattern_detection_config or {}).get("patterns", [])
 
-            if progress_callback:
-                await progress_callback(30, "Generating transcript...", "processing")
-
+            # Step 2: Generate transcript (skip if patterns_only mode)
             transcript = cached_transcript
-            if not transcript:
-                transcript = await VideoService.generate_transcript(
-                    video_path, processing_mode=processing_mode
-                )
+            if pattern_mode != "patterns_only":
+                if should_cancel and await should_cancel():
+                    raise Exception("Task cancelled")
 
-            # Step 3: AI analysis
-            if should_cancel and await should_cancel():
-                raise Exception("Task cancelled")
+                if progress_callback:
+                    await progress_callback(30, "Generating transcript...", "processing")
 
-            if progress_callback:
-                await progress_callback(
-                    50, "Analyzing content with AI...", "processing"
-                )
+                if not transcript:
+                    transcript = await VideoService.generate_transcript(
+                        video_path, processing_mode=processing_mode
+                    )
+            else:
+                transcript = transcript or ""
 
-            relevant_parts = None
-            if cached_analysis_json:
-                try:
-                    cached_analysis = json.loads(cached_analysis_json)
-                    segments = cached_analysis.get("most_relevant_segments", [])
-                    if not segments:
-                        logger.info(
-                            "Ignoring cached transcript analysis with no clip segments"
+            # Step 3: AI analysis (skip if patterns_only mode)
+            segments_json: List[Dict[str, Any]] = []
+            analysis_json = None
+            summary = None
+            key_topics = None
+
+            if pattern_mode != "patterns_only":
+                if should_cancel and await should_cancel():
+                    raise Exception("Task cancelled")
+
+                if progress_callback:
+                    await progress_callback(
+                        50, "Analyzing content with AI...", "processing"
+                    )
+
+                relevant_parts = None
+                if cached_analysis_json:
+                    try:
+                        cached_analysis = json.loads(cached_analysis_json)
+                        segments = cached_analysis.get("most_relevant_segments", [])
+                        if not segments:
+                            logger.info(
+                                "Ignoring cached transcript analysis with no clip segments"
+                            )
+                        else:
+
+                            class _SimpleResult:
+                                def __init__(self, payload: Dict[str, Any]):
+                                    self.summary = payload.get("summary")
+                                    self.key_topics = payload.get("key_topics")
+                                    self.most_relevant_segments = payload.get(
+                                        "most_relevant_segments", []
+                                    )
+
+                            relevant_parts = _SimpleResult(
+                                {
+                                    "summary": cached_analysis.get("summary"),
+                                    "key_topics": cached_analysis.get("key_topics", []),
+                                    "most_relevant_segments": segments,
+                                }
+                            )
+                    except Exception:
+                        relevant_parts = None
+
+                if relevant_parts is None:
+                    try:
+                        clip_signals = await run_in_thread(
+                            build_clip_signal_summary,
+                            video_path,
+                            transcript,
                         )
-                    else:
+                    except Exception as exc:
+                        logger.warning("Clip signal extraction failed: %s", exc)
+                        clip_signals = None
+                    relevant_parts = await VideoService.analyze_transcript(
+                        transcript,
+                        clip_signals=clip_signals,
+                    )
 
-                        class _SimpleResult:
-                            def __init__(self, payload: Dict[str, Any]):
-                                self.summary = payload.get("summary")
-                                self.key_topics = payload.get("key_topics")
-                                self.most_relevant_segments = payload.get(
-                                    "most_relevant_segments", []
-                                )
-
-                        relevant_parts = _SimpleResult(
+                raw_segments = relevant_parts.most_relevant_segments
+                for segment in raw_segments:
+                    if isinstance(segment, dict):
+                        virality = segment.get("virality") or {}
+                        if hasattr(virality, "model_dump"):
+                            virality = virality.model_dump()
+                        segments_json.append(
                             {
-                                "summary": cached_analysis.get("summary"),
-                                "key_topics": cached_analysis.get("key_topics", []),
-                                "most_relevant_segments": segments,
+                                "start_time": segment.get("start_time"),
+                                "end_time": segment.get("end_time"),
+                                "text": segment.get("text", ""),
+                                "relevance_score": segment.get("relevance_score", 0.0),
+                                "reasoning": segment.get("reasoning", ""),
+                                "virality_score": virality.get("total_score", 0),
+                                "hook_score": virality.get("hook_score", 0),
+                                "engagement_score": virality.get("engagement_score", 0),
+                                "value_score": virality.get("value_score", 0),
+                                "shareability_score": virality.get("shareability_score", 0),
+                                "hook_type": virality.get("hook_type"),
                             }
                         )
-                except Exception:
-                    relevant_parts = None
+                    else:
+                        virality = segment.virality.model_dump() if segment.virality else {}
+                        segments_json.append(
+                            {
+                                "start_time": segment.start_time,
+                                "end_time": segment.end_time,
+                                "text": segment.text,
+                                "relevance_score": segment.relevance_score,
+                                "reasoning": segment.reasoning,
+                                "virality_score": virality.get("total_score", 0),
+                                "hook_score": virality.get("hook_score", 0),
+                                "engagement_score": virality.get("engagement_score", 0),
+                                "value_score": virality.get("value_score", 0),
+                                "shareability_score": virality.get("shareability_score", 0),
+                                "hook_type": virality.get("hook_type"),
+                            }
+                        )
 
-            if relevant_parts is None:
+                if processing_mode == "fast":
+                    segments_json = segments_json[: runtime_config.fast_mode_max_clips]
+
+                analysis_json = json.dumps(
+                    {
+                        "summary": relevant_parts.summary if relevant_parts else None,
+                        "key_topics": relevant_parts.key_topics
+                        if relevant_parts
+                        else [],
+                        "most_relevant_segments": segments_json,
+                    }
+                )
+                summary = relevant_parts.summary if relevant_parts else None
+                key_topics = relevant_parts.key_topics if relevant_parts else None
+
+            # Step 3.5: Pattern detection (if enabled)
+            if pattern_enabled and pattern_patterns:
+                if should_cancel and await should_cancel():
+                    raise Exception("Task cancelled")
+
+                if progress_callback:
+                    await progress_callback(
+                        55, "Scanning video for visual patterns...", "processing"
+                    )
+
+                def _progress(frame: int, total: int):
+                    pass
+
                 try:
-                    clip_signals = await run_in_thread(
-                        build_clip_signal_summary,
+                    pattern_matches = await run_in_thread(
+                        detect_patterns_in_video,
                         video_path,
-                        transcript,
+                        pattern_patterns,
+                        frame_sample_rate=5,
+                        progress_callback=_progress,
+                    )
+
+                    pattern_segments = build_segments_from_matches(pattern_matches)
+
+                    segments_json = merge_segments(
+                        segments_json,
+                        pattern_segments,
+                        mode=pattern_mode,
                     )
                 except Exception as exc:
-                    logger.warning("Clip signal extraction failed: %s", exc)
-                    clip_signals = None
-                relevant_parts = await VideoService.analyze_transcript(
-                    transcript,
-                    clip_signals=clip_signals,
-                )
+                    logger.warning("Pattern detection failed: %s", exc)
 
             # Step 4: Create clips
             if should_cancel and await should_cancel():
@@ -436,66 +547,15 @@ class VideoService:
             if progress_callback:
                 await progress_callback(70, "Creating video clips...", "processing")
 
-            raw_segments = relevant_parts.most_relevant_segments
-            segments_json: List[Dict[str, Any]] = []
-            for segment in raw_segments:
-                if isinstance(segment, dict):
-                    virality = segment.get("virality") or {}
-                    if hasattr(virality, "model_dump"):
-                        virality = virality.model_dump()
-                    segments_json.append(
-                        {
-                            "start_time": segment.get("start_time"),
-                            "end_time": segment.get("end_time"),
-                            "text": segment.get("text", ""),
-                            "relevance_score": segment.get("relevance_score", 0.0),
-                            "reasoning": segment.get("reasoning", ""),
-                            "virality_score": virality.get("total_score", 0),
-                            "hook_score": virality.get("hook_score", 0),
-                            "engagement_score": virality.get("engagement_score", 0),
-                            "value_score": virality.get("value_score", 0),
-                            "shareability_score": virality.get("shareability_score", 0),
-                            "hook_type": virality.get("hook_type"),
-                        }
-                    )
-                else:
-                    virality = segment.virality.model_dump() if segment.virality else {}
-                    segments_json.append(
-                        {
-                            "start_time": segment.start_time,
-                            "end_time": segment.end_time,
-                            "text": segment.text,
-                            "relevance_score": segment.relevance_score,
-                            "reasoning": segment.reasoning,
-                            "virality_score": virality.get("total_score", 0),
-                            "hook_score": virality.get("hook_score", 0),
-                            "engagement_score": virality.get("engagement_score", 0),
-                            "value_score": virality.get("value_score", 0),
-                            "shareability_score": virality.get("shareability_score", 0),
-                            "hook_type": virality.get("hook_type"),
-                        }
-                    )
-
-            if processing_mode == "fast":
-                segments_json = segments_json[: runtime_config.fast_mode_max_clips]
-
             return {
                 "segments": segments_json,
                 "segments_to_render": segments_json,
                 "video_path": str(video_path),
                 "clips": [],
-                "summary": relevant_parts.summary if relevant_parts else None,
-                "key_topics": relevant_parts.key_topics if relevant_parts else None,
+                "summary": summary,
+                "key_topics": key_topics,
                 "transcript": transcript,
-                "analysis_json": json.dumps(
-                    {
-                        "summary": relevant_parts.summary if relevant_parts else None,
-                        "key_topics": relevant_parts.key_topics
-                        if relevant_parts
-                        else [],
-                        "most_relevant_segments": segments_json,
-                    }
-                ),
+                "analysis_json": analysis_json,
             }
 
         except Exception as e:
