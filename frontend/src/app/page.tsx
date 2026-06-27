@@ -1512,7 +1512,7 @@ export default function Home() {
                               label: "",
                               file: null,
                               imagePath: "",
-                              threshold: 0.8,
+                              threshold: 0.6,
                               preSeconds: 60,
                               postSeconds: 60,
                             },

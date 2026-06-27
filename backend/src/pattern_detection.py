@@ -1,6 +1,7 @@
 """
 Frame-based visual pattern detection using OpenCV template matching.
 Scans video frames for reference images and returns timestamps of matches.
+Enhanced with multi-scale matching, feature-based matching, and robust preprocessing.
 """
 
 import logging
@@ -13,19 +14,112 @@ import cv2
 logger = logging.getLogger(__name__)
 
 
+def _preprocess_image(img: np.ndarray, use_edges: bool = True) -> np.ndarray:
+    """Apply preprocessing to improve matching robustness."""
+    # CLAHE for contrast enhancement
+    if len(img.shape) == 3:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        l = clahe.apply(l)
+        lab = cv2.merge([l, a, b])
+        img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+
+    if use_edges:
+        gray = cv2.Canny(gray, 50, 150)
+
+    return gray
+
+
 def _pyramid_downsample(
-    gray: np.ndarray, max_levels: int = 3
+    gray: np.ndarray, max_levels: int = 4, scale_factor: float = 0.75
 ) -> List[Tuple[float, np.ndarray]]:
-    """Generate a multi-scale pyramid for the image.
+    """Generate a multi-scale pyramid with finer granularity.
     Returns list of (scale_factor, scaled_image) pairs."""
     levels = [(1.0, gray)]
-    for _ in range(max_levels):
+    for i in range(max_levels):
         prev = levels[-1][1]
         if prev.shape[0] < 32 or prev.shape[1] < 32:
             break
-        smaller = cv2.pyrDown(prev)
-        levels.append((levels[-1][0] * 0.5, smaller))
+        new_scale = levels[-1][0] * scale_factor
+        # Use resize for more precise scale control instead of pyrDown
+        h = int(gray.shape[0] * new_scale)
+        w = int(gray.shape[1] * new_scale)
+        if h < 32 or w < 32:
+            break
+        resized = cv2.resize(gray, (w, h), interpolation=cv2.INTER_AREA)
+        levels.append((new_scale, resized))
+    # Also add upscaling for when template is smaller than in-video element
+    for i in range(2):
+        prev = levels[0][1]
+        new_scale = 1.0 + (i + 1) * 0.25
+        h = int(gray.shape[0] * new_scale)
+        w = int(gray.shape[1] * new_scale)
+        resized = cv2.resize(gray, (w, h), interpolation=cv2.INTER_LINEAR)
+        levels.append((new_scale, resized))
     return levels
+
+
+def _feature_match(
+    frame_gray: np.ndarray,
+    template_gray: np.ndarray,
+    min_matches: int = 10,
+) -> Tuple[float, Optional[Tuple[int, int, int, int]]]:
+    """
+    Feature-based matching using ORB descriptors.
+    Returns (confidence, bounding_box) or (0.0, None) if no match.
+    """
+    orb = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2, nlevels=8)
+
+    kp1, des1 = orb.detectAndCompute(template_gray, None)
+    kp2, des2 = orb.detectAndCompute(frame_gray, None)
+
+    if des1 is None or des2 is None or len(kp1) < min_matches or len(kp2) < min_matches:
+        return 0.0, None
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    try:
+        matches = bf.knnMatch(des1, des2, k=2)
+    except cv2.error:
+        return 0.0, None
+
+    # Lowe's ratio test
+    good_matches = []
+    for m_list in matches:
+        if len(m_list) == 2:
+            m, n = m_list
+            if m.distance < 0.75 * n.distance:
+                good_matches.append(m)
+
+    if len(good_matches) < min_matches:
+        return 0.0, None
+
+    # Compute bounding box from matched keypoints
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+
+    try:
+        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+        if M is None:
+            return 0.0, None
+    except cv2.error:
+        return 0.0, None
+
+    h, w = template_gray.shape
+    corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
+    dst = cv2.perspectiveTransform(corners, M)
+
+    x_min = max(0, int(dst[:,:,0].min()))
+    y_min = max(0, int(dst[:,:,1].min()))
+    x_max = int(dst[:,:,0].max())
+    y_max = int(dst[:,:,1].max())
+
+    # Confidence based on number of good matches relative to template features
+    confidence = min(1.0, len(good_matches) / max(len(kp1), 20))
+
+    return confidence, (x_min, y_min, x_max - x_min, y_max - y_min)
 
 
 def _non_max_suppression(
@@ -58,6 +152,51 @@ def _seconds_to_timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _match_template_multi_scale(
+    search_region: np.ndarray,
+    template: np.ndarray,
+    pyramid_levels: List[Tuple[float, np.ndarray]],
+    use_preprocessing: bool = True,
+) -> Tuple[float, Tuple[int, int]]:
+    """
+    Match template at multiple scales and preprocessing modes.
+    Returns (best_confidence, best_location).
+    """
+    best_conf = 0.0
+    best_loc = (0, 0)
+
+    # Multiple preprocessing modes for robustness
+    preprocess_modes = [False, True] if use_preprocessing else [False]
+
+    for use_edges in preprocess_modes:
+        proc_region = _preprocess_image(search_region, use_edges=use_edges) if use_edges else search_region
+        proc_template = _preprocess_image(template, use_edges=use_edges) if use_edges else template
+
+        for scale, scaled_tmpl in pyramid_levels:
+            th, tw = scaled_tmpl.shape[:2]
+            if th > proc_region.shape[0] or tw > proc_region.shape[1]:
+                continue
+            if th < 16 or tw < 16:
+                continue
+
+            scaled_tmpl_proc = cv2.resize(scaled_tmpl, (tw, th)) if use_edges else cv2.resize(scaled_tmpl, (tw, th))
+            if len(proc_region.shape) == 3 and len(scaled_tmpl_proc.shape) == 2:
+                continue
+            if len(proc_region.shape) == 2 and len(scaled_tmpl_proc.shape) == 3:
+                continue
+
+            try:
+                result = cv2.matchTemplate(proc_region, scaled_tmpl_proc, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                if max_val > best_conf:
+                    best_conf = max_val
+                    best_loc = max_loc
+            except cv2.error:
+                continue
+
+    return best_conf, best_loc
+
+
 def detect_patterns_in_video(
     video_path: Path,
     patterns: List[Dict[str, Any]],
@@ -73,7 +212,7 @@ def detect_patterns_in_video(
             {
                 "image_path": str,       # Path to reference image
                 "label": str,            # Human-readable name
-                "threshold": float,      # Match confidence 0.0-1.0 (default 0.8)
+                "threshold": float,      # Match confidence 0.0-1.0 (default 0.6)
                 "pre_seconds": int,      # Seconds before match for clip start
                 "post_seconds": int,     # Seconds after match for clip end
                 "match_region": list | None,  # [x, y, w, h] for ROI
@@ -97,26 +236,28 @@ def detect_patterns_in_video(
         logger.info("No patterns provided, skipping detection")
         return []
 
-    # Load template images
+    # Load template images with preprocessing
     templates = []
     for p in patterns:
         img_path = Path(p["image_path"])
         if not img_path.exists():
             logger.warning("Pattern image not found: %s", img_path)
             continue
-        template = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
-        if template is None:
+        template_bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        if template_bgr is None:
             logger.warning("Could not read pattern image: %s", img_path)
             continue
+        template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
         templates.append({
             "label": p.get("label", img_path.stem),
-            "template": template,
-            "threshold": p.get("threshold", 0.8),
+            "template_bgr": template_bgr,
+            "template_gray": template_gray,
+            "threshold": p.get("threshold", 0.6),
             "pre_seconds": p.get("pre_seconds", 60),
             "post_seconds": p.get("post_seconds", 60),
             "match_region": p.get("match_region"),
-            "w": template.shape[1],
-            "h": template.shape[0],
+            "w": template_bgr.shape[1],
+            "h": template_bgr.shape[0],
         })
 
     if not templates:
@@ -166,22 +307,23 @@ def detect_patterns_in_video(
             logger.error("Could not determine video duration")
             return []
 
-    proc_width = 480
-    proc_height = 270
+    # Increased processing resolution for better accuracy
+    proc_width = 854
+    proc_height = 480
 
     command = [
         "ffmpeg", "-v", "error", "-an", "-sn",
         "-i", str(video_path),
         "-vf", f"fps={fps / frame_sample_rate:.3f},scale={proc_width}:{proc_height}",
-        "-pix_fmt", "gray",
+        "-pix_fmt", "rgb24",
         "-f", "rawvideo",
         "-threads", "0",
         "-",
     ]
 
     logger.info(
-        "Starting pattern detection: %d templates, %.1f fps (sample every %d frames)",
-        len(templates), fps / frame_sample_rate, frame_sample_rate,
+        "Starting pattern detection: %d templates, %.1f fps (sample every %d frames), resolution %dx%d",
+        len(templates), fps / frame_sample_rate, frame_sample_rate, proc_width, proc_height,
     )
 
     try:
@@ -192,10 +334,8 @@ def detect_patterns_in_video(
         logger.error("Failed to start ffmpeg for pattern detection: %s", exc)
         return []
 
-    frame_bytes = proc_width * proc_height
-    sample_step = int(fps * frame_sample_rate / fps)
-    if sample_step < 1:
-        sample_step = 1
+    frame_bytes = proc_width * proc_height * 3  # RGB24 = 3 bytes per pixel
+    sample_step = max(1, int(fps * frame_sample_rate / fps))
 
     all_matches: List[Tuple[float, float, float, float, int]] = []
     frame_idx = 0
@@ -217,7 +357,9 @@ def detect_patterns_in_video(
             if progress_callback and frame_idx % (fps * 10) < 1:
                 progress_callback(frame_idx, total_frames)
 
-            gray = np.frombuffer(raw, dtype=np.uint8).reshape(proc_height, proc_width)
+            # Parse RGB frame
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(proc_height, proc_width, 3)
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
             for t_idx, tmpl in enumerate(templates):
                 region = tmpl["match_region"]
@@ -227,27 +369,52 @@ def detect_patterns_in_video(
                     ry = int(ry * proc_height)
                     rw = int(rw * proc_width)
                     rh = int(rh * proc_height)
-                    search_region = gray[ry:ry + rh, rx:rx + rw]
+                    search_region = frame_gray[ry:ry + rh, rx:rx + rw]
+                    search_region_color = frame[ry:ry + rh, rx:rx + rw]
                 else:
-                    search_region = gray
+                    search_region = frame_gray
+                    search_region_color = frame
                     rx = ry = 0
 
-                best_conf = 0.0
-                best_loc = (0, 0)
-                levels = _pyramid_downsample(tmpl["template"])
+                # Strategy 1: Multi-scale template matching with preprocessing
+                pyramid = _pyramid_downsample(tmpl["template_gray"])
+                best_conf, best_loc = _match_template_multi_scale(
+                    search_region, tmpl["template_gray"], pyramid, use_preprocessing=True
+                )
 
-                for scale, scaled_tmpl in levels:
-                    tw = int(scaled_tmpl.shape[1])
-                    th = int(scaled_tmpl.shape[0])
-                    if th > search_region.shape[0] or tw > search_region.shape[1]:
-                        continue
-                    result = cv2.matchTemplate(
-                        search_region, scaled_tmpl, cv2.TM_CCOEFF_NORMED
-                    )
-                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-                    if max_val > best_conf:
-                        best_conf = max_val
-                        best_loc = max_loc
+                # Strategy 2: Feature-based matching as fallback/supplement
+                feat_conf, feat_bbox = _feature_match(search_region, tmpl["template_gray"], min_matches=8)
+
+                # Use the better of the two methods
+                if feat_conf > best_conf:
+                    best_conf = feat_conf
+                    if feat_bbox:
+                        fx, fy, fw, fh = feat_bbox
+                        best_loc = (fx, fy)
+
+                # Strategy 3: Color histogram correlation (supplementary signal)
+                if best_conf < tmpl["threshold"] and len(search_region_color.shape) == 3:
+                    try:
+                        hsv_search = cv2.cvtColor(search_region_color, cv2.COLOR_BGR2HSV)
+                        hsv_template = cv2.cvtColor(tmpl["template_bgr"], cv2.COLOR_BGR2HSV)
+                        h_hist = cv2.calcHist([hsv_search], [0], None, [50], [0, 180])
+                        s_hist = cv2.calcHist([hsv_search], [1], None, [60], [0, 256])
+                        h_hist_t = cv2.calcHist([hsv_template], [0], None, [50], [0, 180])
+                        s_hist_t = cv2.calcHist([hsv_template], [1], None, [60], [0, 256])
+                        cv2.normalize(h_hist, h_hist)
+                        cv2.normalize(s_hist, s_hist)
+                        cv2.normalize(h_hist_t, h_hist_t)
+                        cv2.normalize(s_hist_t, s_hist_t)
+                        color_score = (
+                            cv2.compareHist(h_hist, h_hist_t, cv2.HISTCMP_CORREL) * 0.6 +
+                            cv2.compareHist(s_hist, s_hist_t, cv2.HISTCMP_CORREL) * 0.4
+                        )
+                        if color_score > best_conf and color_score > 0.5:
+                            best_conf = color_score
+                            # For color match, use center of region as location
+                            best_loc = (search_region.shape[1] // 4, search_region.shape[0] // 4)
+                    except cv2.error:
+                        pass
 
                 if best_conf >= tmpl["threshold"]:
                     bx, by = best_loc
@@ -257,6 +424,10 @@ def detect_patterns_in_video(
                     cx = (bx + tmpl["w"] / 2) / proc_width
                     cy = (by + tmpl["h"] / 2) / proc_height
                     all_matches.append((best_conf, cx, cy, timestamp, t_idx))
+                    logger.debug(
+                        "Match at %.1fs: conf=%.3f pattern=%s",
+                        timestamp, best_conf, tmpl["label"]
+                    )
 
             frame_idx += 1
 
