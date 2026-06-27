@@ -202,6 +202,9 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
         data.get("remove_filler_words"),
         data.get("filtered_words"),
     )
+    pattern_detection = data.get("pattern_detection")
+    if pattern_detection and not isinstance(pattern_detection, dict):
+        pattern_detection = None
     if not raw_source or not raw_source.get("url"):
         raise HTTPException(status_code=400, detail="Source URL is required")
 
@@ -231,6 +234,11 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
 
         # Enqueue job for worker
         queue_adapter = getattr(request.app.state, "queue_adapter", JobQueue)
+        # Extract pattern detection config for worker args
+        pattern_detection_config = (
+            json.dumps(pattern_detection) if pattern_detection else None
+        )
+
         job_id = await queue_adapter.enqueue_processing_job(
             "process_video_task",
             processing_mode,
@@ -246,20 +254,21 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
             output_format,
             add_subtitles,
             cleanup_settings,
+            pattern_detection_config,
         )
 
         # Save source metadata for resume/retries in environments without sources.url column
-        await _save_task_source_metadata(
-            task_id,
-            _merge_task_source_metadata(
-                None,
-                source_url=raw_source["url"],
-                source_type=source_type,
-                output_format=output_format,
-                add_subtitles=add_subtitles,
-                cleanup_settings=cleanup_settings,
-            ),
+        metadata = _merge_task_source_metadata(
+            None,
+            source_url=raw_source["url"],
+            source_type=source_type,
+            output_format=output_format,
+            add_subtitles=add_subtitles,
+            cleanup_settings=cleanup_settings,
         )
+        if pattern_detection:
+            metadata["pattern_detection"] = pattern_detection
+        await _save_task_source_metadata(task_id, metadata)
 
         logger.info(f"Task {task_id} created and job {job_id} enqueued")
 

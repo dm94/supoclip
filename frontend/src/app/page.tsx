@@ -18,7 +18,7 @@ import { track } from "@/lib/datafast";
 import { formatSupportMessage, parseApiError } from "@/lib/api-error";
 import Link from "next/link";
 import Image from "next/image";
-import { ArrowRight, Youtube, CheckCircle, AlertCircle, Loader2, Palette, Type, Paintbrush, Film, Sparkles, Upload, Monitor, Menu, X, LogOut, List, Shield, Settings } from "lucide-react";
+import { ArrowRight, Youtube, CheckCircle, AlertCircle, Loader2, Palette, Type, Paintbrush, Film, Sparkles, Upload, Monitor, Menu, X, LogOut, List, Shield, Settings, ImagePlus, Trash2 } from "lucide-react";
 import { Switch } from "@/components/ui/switch";
 import LandingPage from "@/components/landing-page";
 import { isLandingOnlyModeEnabled } from "@/lib/app-flags";
@@ -52,7 +52,7 @@ interface FontOption {
 
 type OutputFormat = "vertical" | "vertical_pan" | "vertical_split" | "original";
 
-const MAX_VIDEO_UPLOAD_BYTES = 1_000_000_000;
+const MAX_VIDEO_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024;
 
 type DirectUploadAuthorization = {
   directUpload: true;
@@ -123,7 +123,7 @@ async function requestUploadAuthorization(): Promise<UploadAuthorization> {
 
 async function uploadVideoFile(file: File): Promise<string> {
   if (file.size > MAX_VIDEO_UPLOAD_BYTES) {
-    throw new Error("Uploaded file is too large. Please upload a video under 1 GB.");
+    throw new Error("Uploaded file is too large. Please upload a video under 2 GB.");
   }
 
   const uploadAuthorization = await requestUploadAuthorization();
@@ -143,7 +143,7 @@ async function uploadVideoFile(file: File): Promise<string> {
   if (!uploadResponse.ok) {
     const fallbackMessage =
       uploadResponse.status === 413
-        ? "Uploaded file is too large. Please upload a video under 1 GB."
+        ? "Uploaded file is too large. Please upload a video under 2 GB."
         : `Upload error: ${uploadResponse.status}`;
     const uploadError = await parseApiError(uploadResponse, fallbackMessage);
     throw new Error(formatSupportMessage(uploadError));
@@ -169,7 +169,7 @@ async function uploadVideoFileViaProxy(file: File): Promise<string> {
   if (!uploadResponse.ok) {
     const fallbackMessage =
       uploadResponse.status === 413
-        ? "Uploaded file is too large. Please upload a video under 1 GB."
+        ? "Uploaded file is too large. Please upload a video under 2 GB."
         : `Upload error: ${uploadResponse.status}`;
     const uploadError = await parseApiError(uploadResponse, fallbackMessage);
     throw new Error(formatSupportMessage(uploadError));
@@ -219,6 +219,18 @@ export default function Home() {
   const [pauseThresholdMs, setPauseThresholdMs] = useState("900");
   const [removeFillerWords, setRemoveFillerWords] = useState(false);
   const [filteredWords, setFilteredWords] = useState("");
+
+  // Pattern detection states
+  const [patternDetectionEnabled, setPatternDetectionEnabled] = useState(false);
+  const [patternDetectionMode, setPatternDetectionMode] = useState<"patterns_only" | "combined" | "ai_only">("patterns_only");
+  const [patterns, setPatterns] = useState<Array<{
+    label: string;
+    file: File | null;
+    imagePath: string;
+    threshold: number;
+    preSeconds: number;
+    postSeconds: number;
+  }>>([]);
 
   // Latest task state
   const [latestTask, setLatestTask] = useState<LatestTask | null>(null);
@@ -526,6 +538,39 @@ export default function Home() {
         videoUrl = await uploadVideoFile(fileRef.current);
       }
 
+      // Upload pattern images if any
+      let patternDetectionPayload = null;
+      if (patternDetectionEnabled && patterns.length > 0) {
+        const uploadedPatterns = [];
+        for (const p of patterns) {
+          if (!p.file) continue;
+          const formData = new FormData();
+          formData.append("file", p.file);
+          const uploadResp = await fetch("/api/tasks/patterns/upload", {
+            method: "POST",
+            body: formData,
+          });
+          if (!uploadResp.ok) {
+            throw new Error(`Failed to upload pattern image: ${p.label || p.file.name}`);
+          }
+          const uploadResult = await uploadResp.json();
+          uploadedPatterns.push({
+            label: p.label || p.file.name.replace(/\.[^/.]+$/, ""),
+            image_path: uploadResult.image_path,
+            threshold: p.threshold,
+            pre_seconds: p.preSeconds,
+            post_seconds: p.postSeconds,
+          });
+        }
+        if (uploadedPatterns.length > 0) {
+          patternDetectionPayload = {
+            enabled: true,
+            mode: patternDetectionMode,
+            patterns: uploadedPatterns,
+          };
+        }
+      }
+
       // Step 1: Start the task (using new refactored endpoint)
       const startResponse = await fetch("/api/tasks/create", {
         method: 'POST',
@@ -551,6 +596,7 @@ export default function Home() {
           pause_threshold_ms: normalizedPauseThreshold,
           remove_filler_words: removeFillerWords,
           filtered_words: normalizedFilteredWords,
+          pattern_detection: patternDetectionPayload,
         }),
       });
 
@@ -982,7 +1028,7 @@ export default function Home() {
                     ) : (
                       <>
                         <p className="text-sm font-medium text-stone-700">Drop a video file here or click to browse</p>
-                        <p className="text-xs text-stone-400 mt-1">MP4, MOV, AVI up to 500MB</p>
+                        <p className="text-xs text-stone-400 mt-1">MP4, MOV, AVI up to 2GB</p>
                       </>
                     )}
                   </div>
@@ -1295,6 +1341,192 @@ export default function Home() {
                 </CardContent>
               </Card>
               </div>
+
+              {/* Visual Pattern Detection Section */}
+              <Card className="border-stone-200">
+                <CardContent className="px-4 pt-0 pb-2.5 space-y-2.5">
+                  <div className="flex items-center justify-between pt-2">
+                    <div className="flex items-center gap-2 text-sm font-medium text-stone-900">
+                      <ImagePlus className="w-4 h-4" />
+                      Visual Pattern Detection
+                    </div>
+                    <Switch
+                      checked={patternDetectionEnabled}
+                      onCheckedChange={setPatternDetectionEnabled}
+                      disabled={generationControlsDisabled}
+                    />
+                  </div>
+                  {patternDetectionEnabled && (
+                    <div className="space-y-3 pt-1">
+                      <p className="text-xs text-stone-500">
+                        Upload reference images (explosions, UI elements, etc.) and the system will scan every
+                        frame for matches, creating clips around each detection.
+                      </p>
+
+                      {/* Mode selector */}
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-medium text-stone-500">Mode</label>
+                        <Select
+                          value={patternDetectionMode}
+                          onValueChange={(v) => setPatternDetectionMode(v as "patterns_only" | "combined" | "ai_only")}
+                          disabled={generationControlsDisabled}
+                        >
+                          <SelectTrigger className="w-full h-10">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="patterns_only">Solo patrones</SelectItem>
+                            <SelectItem value="combined">Combinado con AI</SelectItem>
+                            <SelectItem value="ai_only">Solo AI (deshabilitar patrones)</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      {/* Pattern list */}
+                      {patterns.map((pattern, index) => (
+                        <div key={index} className="border rounded-lg p-3 space-y-2 bg-stone-50 relative">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPatterns(patterns.filter((_, i) => i !== index));
+                            }}
+                            className="absolute top-2 right-2 text-stone-400 hover:text-red-500 transition-colors"
+                            title="Remove pattern"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+
+                          <div className="space-y-1.5">
+                            <label className="text-xs font-medium text-stone-500">Label</label>
+                            <Input
+                              value={pattern.label}
+                              onChange={(e) => {
+                                const updated = [...patterns];
+                                updated[index] = { ...updated[index], label: e.target.value };
+                                setPatterns(updated);
+                              }}
+                              placeholder="explosion, kill_feed, headshot, ..."
+                              disabled={generationControlsDisabled}
+                              className="h-9 text-sm"
+                            />
+                          </div>
+
+                          <div className="space-y-1.5">
+                            <label className="text-xs font-medium text-stone-500">Reference image</label>
+                            <div className="flex items-center gap-2">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  const input = document.createElement("input");
+                                  input.type = "file";
+                                  input.accept = "image/png,image/jpeg,image/bmp";
+                                  input.onchange = (e) => {
+                                    const file = (e.target as HTMLInputElement).files?.[0];
+                                    if (file) {
+                                      const updated = [...patterns];
+                                      updated[index] = { ...updated[index], file, imagePath: "" };
+                                      setPatterns(updated);
+                                    }
+                                  };
+                                  input.click();
+                                }}
+                                disabled={generationControlsDisabled}
+                              >
+                                {pattern.file ? "Replace" : "Browse"}
+                              </Button>
+                              {pattern.file && (
+                                <span className="text-xs text-stone-500 truncate flex-1">{pattern.file.name}</span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="space-y-1.5">
+                              <label className="text-xs font-medium text-stone-500">
+                                Threshold: {pattern.threshold.toFixed(2)}
+                              </label>
+                              <input
+                                type="range"
+                                min="0.5"
+                                max="0.99"
+                                step="0.01"
+                                value={pattern.threshold}
+                                onChange={(e) => {
+                                  const updated = [...patterns];
+                                  updated[index] = { ...updated[index], threshold: parseFloat(e.target.value) };
+                                  setPatterns(updated);
+                                }}
+                                disabled={generationControlsDisabled}
+                                className="w-full h-1.5 bg-stone-300 rounded-full appearance-none cursor-pointer accent-stone-900"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="space-y-1.5">
+                              <label className="text-xs font-medium text-stone-500">Seconds before</label>
+                              <Input
+                                type="number"
+                                min={5}
+                                max={300}
+                                value={pattern.preSeconds}
+                                onChange={(e) => {
+                                  const updated = [...patterns];
+                                  updated[index] = { ...updated[index], preSeconds: Math.max(5, parseInt(e.target.value) || 30) };
+                                  setPatterns(updated);
+                                }}
+                                disabled={generationControlsDisabled}
+                                className="h-9 text-sm"
+                              />
+                            </div>
+                            <div className="space-y-1.5">
+                              <label className="text-xs font-medium text-stone-500">Seconds after</label>
+                              <Input
+                                type="number"
+                                min={5}
+                                max={300}
+                                value={pattern.postSeconds}
+                                onChange={(e) => {
+                                  const updated = [...patterns];
+                                  updated[index] = { ...updated[index], postSeconds: Math.max(5, parseInt(e.target.value) || 30) };
+                                  setPatterns(updated);
+                                }}
+                                disabled={generationControlsDisabled}
+                                className="h-9 text-sm"
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setPatterns([
+                            ...patterns,
+                            {
+                              label: "",
+                              file: null,
+                              imagePath: "",
+                              threshold: 0.6,
+                              preSeconds: 60,
+                              postSeconds: 60,
+                            },
+                          ]);
+                        }}
+                        disabled={generationControlsDisabled}
+                        className="w-full"
+                      >
+                        + Add pattern
+                      </Button>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
 
               {isLoading && (
                 <div className="space-y-4">
